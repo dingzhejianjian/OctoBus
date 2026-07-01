@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { Agent } from 'undici';
 
 import { GrpcError, grpcStatus } from '@chaitin-ai/octobus-sdk';
 
@@ -44,9 +45,10 @@ const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj ?? {}, key
 
 const firstDefined = (...values) => values.find((v) => v !== undefined && v !== null);
 
-const unwrapString = (source) => {
+const unwrapString = (source, depth = 0) => {
+  if (depth > 10) return '';
   if (source === undefined || source === null) return '';
-  if (typeof source === 'object' && source !== null && hasOwn(source, 'value')) return unwrapString(source.value);
+  if (typeof source === 'object' && source !== null && hasOwn(source, 'value')) return unwrapString(source.value, depth + 1);
   return String(source);
 };
 
@@ -194,28 +196,32 @@ const parseJson = (text) => {
 };
 
 const mapHttpError = (res, bodyText) => {
-  const text = String(bodyText || '');
-  if (res.status === 401 || res.status === 403) throw errorWithCode('PERMISSION_DENIED', `upstream http ${res.status}: ${text}`);
-  if (res.status >= 400 && res.status < 500) throw errorWithCode('FAILED_PRECONDITION', `upstream http ${res.status}: ${text}`);
-  throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}: ${text}`);
+  if (res.status === 401 || res.status === 403) throw errorWithCode('PERMISSION_DENIED', `upstream http ${res.status}`);
+  if (res.status === 429) throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}`);
+  if (res.status >= 400 && res.status < 500) throw errorWithCode('FAILED_PRECONDITION', `upstream http ${res.status}`);
+  throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}`);
 };
 
 const buildTlsOptions = (bindings = {}) => {
   if (!toBoolean(bindings.skipTlsVerify) && !toBoolean(bindings.tlsInsecureSkipVerify) && !toBoolean(bindings.insecureSkipVerify)) return {};
-  return { insecureSkipVerify: true, tlsInsecureSkipVerify: true, skipTlsVerify: true };
+  return { dispatcher: new Agent({ connect: { rejectUnauthorized: false } }) };
 };
 
 const fetchJson = async (url, init, { bindings = {}, timeoutMs }) => {
-  let res;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || DEFAULT_TIMEOUT_MS);
   try {
-    res = await fetch(url, { ...init, timeoutMs, ...buildTlsOptions(bindings) });
+    const res = await fetch(url, { ...init, signal: controller.signal, ...buildTlsOptions(bindings) });
+    const text = await res.text();
+    if (!res.ok) mapHttpError(res, text);
+    return { json: parseJson(text), text };
   } catch (err) {
+    if (err instanceof GrpcError) throw err;
     const reason = err?.cause?.message || err?.message || 'fetch failed';
     throw errorWithCode('UNAVAILABLE', reason);
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await res.text();
-  if (!res.ok) mapHttpError(res, text);
-  return { json: parseJson(text), text };
 };
 
 // ---- Context resolution ----
@@ -328,24 +334,28 @@ const makeRuntime = (ctx = {}) => {
       Detail: comment.slice(0, 100),
     }));
 
-    const params = { Data: rules, Type: 0, Enable: 0 };
+    const params = { Data: rules, Type: 0, Enable: 1 };
     const response = await callCFWAPI('CreateAcRules', params, { meta, bindings, timeoutMs });
     return { code: 0, message: response.RequestId || 'ok' };
   };
 
   const runUnblock = async (req = {}) => {
     const ips = ensureIPs(req);
-
-    // List existing rules to find matching ones
-    const listResp = await callCFWAPI('DescribeAcLists', { Limit: 100, Offset: 0 }, { meta, bindings, timeoutMs });
-    const allRules = listResp.Data || [];
     const ipSet = new Set(ips);
+    const ruleIds = [];
 
-    // Find rule IDs to delete (match by source IP)
-    const ruleIds = allRules
-      .filter((rule) => ipSet.has(rule.SourceIp))
-      .map((rule) => rule.Id)
-      .filter(Boolean);
+    // Paginate through all rules
+    let offset = 0;
+    const PAGE_SIZE = 100;
+    while (true) {
+      const listResp = await callCFWAPI('DescribeAcLists', { Limit: PAGE_SIZE, Offset: offset }, { meta, bindings, timeoutMs });
+      const pageRules = listResp.Data || [];
+      for (const rule of pageRules) {
+        if (ipSet.has(rule.SourceIp) && rule.Id) ruleIds.push(rule.Id);
+      }
+      if (pageRules.length < PAGE_SIZE) break;
+      offset += PAGE_SIZE;
+    }
 
     if (ruleIds.length === 0) {
       return { code: 0, message: 'no matching rules found' };

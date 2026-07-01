@@ -108,6 +108,7 @@ test('BlockIP sends correct API request', async () => {
   assert.equal(captured.headers['X-TC-Action'], 'CreateAcRules');
   assert.equal(captured.body.Data[0].SourceIp, '1.1.1.1');
   assert.equal(captured.body.Data[0].Strategy, 'drop');
+  assert.equal(captured.body.Enable, 1);
 });
 
 test('BlockIP validates IPs', async () => {
@@ -154,6 +155,8 @@ test('maps API errors', async () => {
 test('handles HTTP errors', async () => {
   setFetch(async () => response(403, 'x'));
   await expectGrpcError(() => handlers['Tencent_CFW.Tencent_CFW/ListRules']({ ...ctx(), request: {} }), 'PERMISSION_DENIED');
+  setFetch(async () => response(429, 'x'));
+  await expectGrpcError(() => handlers['Tencent_CFW.Tencent_CFW/ListRules']({ ...ctx(), request: {} }), 'UNAVAILABLE');
   setFetch(async () => response(500, 'x'));
   await expectGrpcError(() => handlers['Tencent_CFW.Tencent_CFW/ListRules']({ ...ctx(), request: {} }), 'UNAVAILABLE');
   setFetch(async () => { throw Object.assign(new Error('x'), { cause: new Error('t') }); });
@@ -165,9 +168,36 @@ test('handles empty responses', async () => {
   await expectGrpcError(() => handlers['Tencent_CFW.Tencent_CFW/ListRules']({ ...ctx(), request: {} }), 'UNKNOWN');
 });
 
+test('UnblockIP paginates through all rules', async () => {
+  let callCount = 0;
+  setFetch(async (url, init) => {
+    callCount++;
+    const a = init.headers['X-TC-Action'];
+    if (a === 'DescribeAcLists') {
+      const body = JSON.parse(init.body);
+      if (body.Offset === 0) {
+        // First page: 100 rules, no match
+        const rules = Array.from({ length: 100 }, (_, i) => ({ Id: i + 1, SourceIp: `10.0.0.${i + 1}` }));
+        return response(200, { Response: { Total: 101, Data: rules, RequestId: 'r1' } });
+      }
+      // Second page: 1 rule, the one we want
+      return response(200, { Response: { Total: 101, Data: [{ Id: 200, SourceIp: '1.1.1.1' }], RequestId: 'r2' } });
+    }
+    if (a === 'DeleteAcRule') return response(200, { Response: { RequestId: 'del-ok' } });
+    return response(200, { Response: { Error: { Code: 'Unknown', Message: 'unexpected' } } });
+  });
+  const result = await handlers['Tencent_CFW.Tencent_CFW/UnblockIP']({ ...ctx(), request: { ips: ['1.1.1.1'] } });
+  assert.equal(result.code, 0);
+  assert.equal(result.message, 'deleted 1 rules');
+  assert.equal(callCount, 3); // 2 list pages + 1 delete
+});
+
 test('helper utilities', () => {
   assert.equal(_test.firstDefined(undefined, null, 'x'), 'x');
   assert.equal(_test.unwrapString({ value: { value: 'nested' } }), 'nested');
+  assert.equal(_test.unwrapString({ value: { value: { value: { value: { value: { value: { value: { value: { value: { value: { value: 'deep' } } } } } } } } } } }, 0), '');
+  assert.equal(_test.unwrapString(undefined), '');
+  assert.equal(_test.unwrapString(123), '123');
   assert.equal(_test.toBoolean({ value: 'yes' }), true);
   assert.equal(_test.optionalUint32({ value: '10.9' }), 10);
 });
