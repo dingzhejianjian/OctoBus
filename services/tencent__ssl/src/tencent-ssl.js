@@ -119,10 +119,10 @@ const parseJson = (text) => {
 };
 
 const mapHttpError = (res, bodyText) => {
-  const text = String(bodyText || '');
-  if (res.status === 401 || res.status === 403) throw errorWithCode('PERMISSION_DENIED', `upstream http ${res.status}: ${text}`);
-  if (res.status >= 400 && res.status < 500) throw errorWithCode('FAILED_PRECONDITION', `upstream http ${res.status}: ${text}`);
-  throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}: ${text}`);
+  if (res.status === 401 || res.status === 403) throw errorWithCode('PERMISSION_DENIED', `upstream http ${res.status}`);
+  if (res.status === 429) throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}`);
+  if (res.status >= 400 && res.status < 500) throw errorWithCode('FAILED_PRECONDITION', `upstream http ${res.status}`);
+  throw errorWithCode('UNAVAILABLE', `upstream http ${res.status}`);
 };
 
 const buildTlsOptions = (bindings = {}) => {
@@ -131,16 +131,20 @@ const buildTlsOptions = (bindings = {}) => {
 };
 
 const fetchJson = async (url, init, { bindings = {}, timeoutMs }) => {
-  let res;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || DEFAULT_TIMEOUT_MS);
   try {
-    res = await fetch(url, { ...init, timeoutMs, ...buildTlsOptions(bindings) });
+    const res = await fetch(url, { ...init, signal: controller.signal, ...buildTlsOptions(bindings) });
+    const text = await res.text();
+    if (!res.ok) mapHttpError(res, text);
+    return { json: parseJson(text), text };
   } catch (err) {
+    if (err instanceof GrpcError) throw err;
     const reason = err?.cause?.message || err?.message || 'fetch failed';
     throw errorWithCode('UNAVAILABLE', reason);
+  } finally {
+    clearTimeout(timer);
   }
-  const text = await res.text();
-  if (!res.ok) mapHttpError(res, text);
-  return { json: parseJson(text), text };
 };
 
 // ---- Context resolution ----

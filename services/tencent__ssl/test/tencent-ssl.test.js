@@ -147,6 +147,18 @@ test('handles HTTP transport errors', async () => {
     'PERMISSION_DENIED',
   );
 
+  setFetch(async () => response(401, 'unauthorized'));
+  await expectGrpcError(
+    () => handlers['Tencent_SSL.Tencent_SSL/ListCertificates']({ ...ctx(), request: {} }),
+    'PERMISSION_DENIED',
+  );
+
+  setFetch(async () => response(429, 'too many'));
+  await expectGrpcError(
+    () => handlers['Tencent_SSL.Tencent_SSL/ListCertificates']({ ...ctx(), request: {} }),
+    'UNAVAILABLE',
+  );
+
   setFetch(async () => response(500, 'server error'));
   await expectGrpcError(
     () => handlers['Tencent_SSL.Tencent_SSL/ListCertificates']({ ...ctx(), request: {} }),
