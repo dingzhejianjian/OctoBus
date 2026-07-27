@@ -169,6 +169,10 @@ const services = {
     entryFile: "../tencent__qyweixin-group-robot/bin/tencent-qyweixin-group-robot.js",
     serviceModule: "../tencent__qyweixin-group-robot/src/service.js",
   },
+  "tencent-ssl": {
+    entryFile: "../tencent__ssl/bin/tencent-ssl.js",
+    serviceModule: "../tencent__ssl/src/service.js",
+  },
   "tencent-tix-saas": {
     entryFile: "../tencent__tix-saas/bin/tencent-tix-saas.js",
     serviceModule: "../tencent__tix-saas/src/service.js",
