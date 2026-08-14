@@ -37,7 +37,22 @@ type Options struct {
 	Reinstall bool                            `json:"reinstall"`
 	Build     string                          `json:"build"`
 	Recursive bool                            `json:"recursive"`
+	Upload    *UploadedSource                 `json:"-"`
 	Progress  func(ImportProgressEvent) error `json:"-"`
+}
+
+type UploadKind string
+
+const (
+	UploadKindDirectory UploadKind = "directory"
+	UploadKindArchive   UploadKind = "archive"
+	UploadKindNPMLocal  UploadKind = "npm-local"
+)
+
+type UploadedSource struct {
+	Kind          UploadKind
+	Path          string
+	DisplaySource string
 }
 
 type Result struct {
@@ -576,6 +591,9 @@ func (i *Importer) importServiceName(ctx context.Context, opts Options, manifest
 }
 
 func (i *Importer) prepareSource(ctx context.Context, opts Options, staging string) (preparedSource, error) {
+	if opts.Upload != nil {
+		return prepareUploadedSource(opts, staging)
+	}
 	source, serviceRoot, err := splitSourceServiceRoot(opts.Source)
 	if err != nil {
 		return preparedSource{}, err
@@ -640,6 +658,117 @@ func (i *Importer) prepareSource(ctx context.Context, opts Options, staging stri
 		return preparedSource{}, err
 	}
 	return preparedSource{ArtifactPath: artifactPath, PackageDir: packageDir, PackageSHA256: domain.HashBytes(b), PackageSource: sourceWithServiceRoot(source, serviceRoot), ServiceRoot: serviceRoot, BuildAllowed: info.IsDir()}, nil
+}
+
+func prepareUploadedSource(opts Options, staging string) (preparedSource, error) {
+	source, serviceRoot, err := splitSourceServiceRoot(opts.Source)
+	if err != nil {
+		return preparedSource{}, err
+	}
+	if !strings.HasPrefix(source, "client-upload:") {
+		return preparedSource{}, errors.New("uploaded package source must start with client-upload:")
+	}
+	if opts.Upload.Path == "" {
+		return preparedSource{}, errors.New("uploaded package path is required")
+	}
+	switch opts.Upload.Kind {
+	case UploadKindDirectory:
+		return prepareUploadedDirectorySource(opts.Upload.Path, source, serviceRoot, staging)
+	case UploadKindArchive:
+		return prepareUploadedArchiveSource(opts.Upload.Path, source, serviceRoot, staging)
+	case UploadKindNPMLocal:
+		if uploadedSourceHasArchiveSuffix(source) {
+			return prepareUploadedArchiveSource(opts.Upload.Path, source, serviceRoot, staging)
+		}
+		return prepareUploadedDirectorySource(opts.Upload.Path, source, serviceRoot, staging)
+	default:
+		return preparedSource{}, fmt.Errorf("unsupported uploaded source kind %q", opts.Upload.Kind)
+	}
+}
+
+func prepareUploadedDirectorySource(uploadPath, source, serviceRoot, staging string) (preparedSource, error) {
+	artifactPath := filepath.Join(staging, "package.tgz")
+	if err := copyFile(uploadPath, artifactPath, 0o644); err != nil {
+		return preparedSource{}, err
+	}
+	packageDir := filepath.Join(staging, "package")
+	if err := untarGz(artifactPath, staging); err != nil {
+		return preparedSource{}, err
+	}
+	if info, err := os.Stat(packageDir); err != nil {
+		return preparedSource{}, fmt.Errorf("uploaded directory package root missing: %w", err)
+	} else if !info.IsDir() {
+		return preparedSource{}, fmt.Errorf("uploaded directory package root %q is not a directory", filepath.Base(packageDir))
+	}
+	sha, err := hashFile(artifactPath)
+	if err != nil {
+		return preparedSource{}, err
+	}
+	return preparedSource{
+		ArtifactPath:  artifactPath,
+		PackageDir:    packageDir,
+		PackageSHA256: sha,
+		PackageSource: sourceWithServiceRoot(source, serviceRoot),
+		ServiceRoot:   serviceRoot,
+		BuildAllowed:  true,
+	}, nil
+}
+
+func prepareUploadedArchiveSource(uploadPath, source, serviceRoot, staging string) (preparedSource, error) {
+	artifactName, err := uploadedArchiveArtifactName(source)
+	if err != nil {
+		return preparedSource{}, err
+	}
+	artifactPath := filepath.Join(staging, artifactName)
+	if err := copyFile(uploadPath, artifactPath, 0o644); err != nil {
+		return preparedSource{}, err
+	}
+	packageDir := filepath.Join(staging, "package")
+	if strings.HasSuffix(artifactName, ".zip") {
+		err = unzip(artifactPath, packageDir)
+	} else {
+		err = untarGz(artifactPath, packageDir)
+	}
+	if err != nil {
+		return preparedSource{}, err
+	}
+	packageDir = normalizePackageDir(packageDir)
+	sha, err := hashFile(artifactPath)
+	if err != nil {
+		return preparedSource{}, err
+	}
+	return preparedSource{
+		ArtifactPath:  artifactPath,
+		PackageDir:    packageDir,
+		PackageSHA256: sha,
+		PackageSource: sourceWithServiceRoot(source, serviceRoot),
+		ServiceRoot:   serviceRoot,
+		BuildAllowed:  false,
+	}, nil
+}
+
+func uploadedArchiveArtifactName(source string) (string, error) {
+	lower := strings.ToLower(source)
+	if strings.HasSuffix(lower, ".zip") {
+		return "package.zip", nil
+	}
+	if strings.HasSuffix(lower, ".tgz") || strings.HasSuffix(lower, ".tar.gz") {
+		return "package.tgz", nil
+	}
+	return "", fmt.Errorf("unsupported uploaded archive source %q: must end with .tgz, .tar.gz, or .zip", source)
+}
+
+func uploadedSourceHasArchiveSuffix(source string) bool {
+	_, err := uploadedArchiveArtifactName(source)
+	return err == nil
+}
+
+func hashFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return domain.HashBytes(b), nil
 }
 
 func prepareRemoteArchiveSource(ctx context.Context, source, serviceRoot, staging string) (preparedSource, error) {
@@ -863,16 +992,16 @@ func skipDiscoveryDir(name string) bool {
 }
 
 func (i *Importer) packNPM(ctx context.Context, spec, staging string) (preparedSource, error) {
-	cmd := exec.CommandContext(ctx, "npm", "pack", spec, "--pack-destination", staging)
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd := exec.CommandContext(ctx, "npm", "pack", spec, "--pack-destination", staging, "--json")
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return preparedSource{}, fmt.Errorf("npm pack %s: %w: %s", spec, err, strings.TrimSpace(out.String()))
+		return preparedSource{}, fmt.Errorf("npm pack %s: %w: %s", spec, err, strings.TrimSpace(stderr.String()))
 	}
-	packed := strings.TrimSpace(out.String())
-	if idx := strings.LastIndex(packed, "\n"); idx >= 0 {
-		packed = strings.TrimSpace(packed[idx+1:])
+	packed, err := npmPackArtifactName(stdout.String())
+	if err != nil {
+		return preparedSource{}, err
 	}
 	artifactPath := filepath.Join(staging, filepath.Base(packed))
 	packageDir := filepath.Join(staging, "package")
@@ -1320,18 +1449,35 @@ func npmPack(ctx context.Context, dir, destination string) (string, error) {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return "", err
 	}
-	out, err := runNPMOutput(ctx, dir, []string{"pack", "--pack-destination", destination})
+	cmd := exec.CommandContext(ctx, "npm", "pack", "--pack-destination", destination, "--json")
+	cmd.Dir = dir
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("npm pack: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	packed, err := npmPackArtifactName(stdout.String())
 	if err != nil {
 		return "", err
 	}
-	packed := strings.TrimSpace(out)
-	if idx := strings.LastIndex(packed, "\n"); idx >= 0 {
-		packed = strings.TrimSpace(packed[idx+1:])
-	}
-	if packed == "" {
+	return filepath.Join(destination, filepath.Base(packed)), nil
+}
+
+func npmPackArtifactName(output string) (string, error) {
+	if strings.TrimSpace(output) == "" {
 		return "", errors.New("npm pack did not produce a .tgz artifact")
 	}
-	return filepath.Join(destination, filepath.Base(packed)), nil
+	var packed []struct {
+		Filename string `json:"filename"`
+	}
+	if err := json.Unmarshal([]byte(output), &packed); err != nil {
+		return "", fmt.Errorf("parse npm pack JSON output: %w", err)
+	}
+	if len(packed) != 1 || !strings.HasSuffix(strings.ToLower(packed[0].Filename), ".tgz") {
+		return "", errors.New("npm pack did not produce a .tgz artifact")
+	}
+	return filepath.Base(packed[0].Filename), nil
 }
 
 func runNPM(ctx context.Context, dir string, args []string) error {
